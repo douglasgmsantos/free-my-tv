@@ -567,6 +567,8 @@ var Data = (function () {
       fetchList(function (err) {
         if (err) { finish(err); return; }
         listAt = Date.now();
+        pages = {movie: 1, tv: 1};
+        exhausted = {movie: false, tv: false};
         period = p;
         listLang = I18N.lang;
         detailWanted();
@@ -584,6 +586,433 @@ var Data = (function () {
       for (var i = 0; i < list.length; i++) if (!seen[keyOf(list[i])]) { seen[keyOf(list[i])] = true; out.push(list[i]); }
     }
     return out;
+  }
+
+  var PRELOAD = 6, POOL_MAX = 400;
+  var pages = {movie: 1, tv: 1}, exhausted = {movie: false, tv: false}, loadingMore = {};
+
+  function fits(kind, p) { return kind === null || kind === p.kind; }
+
+  function row(kind) {
+    var out = [];
+    if (!KEY) return out;
+    for (var i = 0; i < picks.length; i++) {
+      var p = picks[i];
+      if (fits(kind, p) && p.detailed && p.app && usable(p.app)) out.push(p);
+    }
+    return out;
+  }
+
+  function undetailed(kind) {
+    return picks.filter(function (p) { return fits(kind, p) && !p.detailed; });
+  }
+
+  function fetchPage(kind, done) {
+    var page = ++pages[kind];
+    tmdb('/watch/providers/movie?language=' + lang() + '&watch_region=' + REGION, function (err, res) {
+      if (err) { done(err); return; }
+      var ids = [];
+      for (var i = 0; res.results && i < res.results.length; i++) {
+        var s = service(res.results[i].provider_name, res.results[i].provider_id);
+        if (s && usable(s[1])) ids.push(res.results[i].provider_id);
+      }
+      if (!ids.length) { exhausted[kind] = true; done(null); return; }
+      var path = '/discover/' + kind + '?page=' + page + '&language=' + lang() + '&watch_region=' + REGION
+          + '&with_watch_monetization_types=flatrate&include_adult=false&sort_by=popularity.desc&with_watch_providers='
+          + encodeURIComponent(ids.join('|')) + (CONFIG.hideAnimation ? '&without_genres=' + ANIMATION : '')
+          + (kind === 'movie' ? '&vote_count.gte=30' : '&vote_count.gte=20');
+      tmdb(path, function (e, r) {
+        if (e) { done(e); return; }
+        var seen = {};
+        for (var j = 0; j < picks.length; j++) seen[keyOf(picks[j])] = true;
+        var found = [];
+        for (var k = 0; r.results && k < r.results.length; k++) {
+          if (!seen[kind + ':' + r.results[k].id]) addPick(found, r.results[k], kind);
+        }
+        if (!r.results || !r.results.length || page >= (r.total_pages || 1)) exhausted[kind] = true;
+        picks = picks.concat(found).slice(0, POOL_MAX);
+        if (picks.length >= POOL_MAX) exhausted[kind] = true;
+        done(null);
+      });
+    });
+  }
+
+  function more(kind) {
+    var tag = String(kind);
+    if (!KEY || loadingMore[tag] || fetchingRecs || !installed.length) return;
+    var todo = undetailed(kind).slice(0, PRELOAD);
+    if (todo.length) {
+      loadingMore[tag] = true;
+      changed();
+      each(todo, function (p, next) { details(p, function () { changed(); next(); }); }, function () {
+        loadingMore[tag] = false;
+        saveRecs();
+        changed();
+      });
+      return;
+    }
+    var kinds = kind === null ? ['movie', 'tv'] : [kind];
+    kinds = kinds.filter(function (k) { return !exhausted[k]; });
+    if (!kinds.length) return;
+    loadingMore[tag] = true;
+    changed();
+    each(kinds, function (k, next) { fetchPage(k, function () { next(); }); }, function () {
+      loadingMore[tag] = false;
+      if (undetailed(kind).length) more(kind); else changed();
+    });
+  }
+
+  function fresh(kind) {
+    var tag = String(kind);
+    if (!KEY || loadingMore[tag] || fetchingRecs || !installed.length) return;
+    var kinds = (kind === null ? ['movie', 'tv'] : [kind]).filter(function (k) { return !exhausted[k]; });
+    if (!kinds.length) { more(kind); return; }
+    loadingMore[tag] = true;
+    each(kinds, function (k, next) { fetchPage(k, function () { next(); }); }, function () {
+      loadingMore[tag] = false;
+      more(kind);
+    });
+  }
+
+  function canGrow(kind) {
+    if (!KEY) return false;
+    if (undetailed(kind).length) return true;
+    return kind === null ? !exhausted.movie || !exhausted.tv : !exhausted[kind];
+  }
+
+  var YT_KEY = (CONFIG.youtubeKey || '').trim();
+  var YT_CLIENT = (CONFIG.youtubeClientId || '').trim(), YT_SECRET = (CONFIG.youtubeClientSecret || '').trim();
+  var YT_API = 'https://www.googleapis.com/youtube/v3/', OAUTH = 'https://oauth2.googleapis.com/';
+  var YT_SCOPE = 'https://www.googleapis.com/auth/youtube.readonly';
+  var ytCache = stored('youtube') || {};
+  var videos = ytCache.videos || [], ytAt = ytCache.at || 0, ytToken = ytCache.token || '', ytDone = !!ytCache.done;
+  var feedDone = !!ytCache.feedDone;
+  var ytLoading = false, ytError = '';
+  var auth = stored('ytauth') || null, login = null, loginTimer = 0;
+  var SHORTS_MAX = 180, CHANNELS_MAX = 60, PER_CHANNEL = 4, FEED_DAYS = 21;
+
+  function ytApp() {
+    for (var i = 0; i < installed.length; i++) {
+      if (/youtube\.leanback|TizenYouTube$/.test(installed[i].id) || /^youtube$/i.test(installed[i].title)) return installed[i];
+    }
+    return null;
+  }
+
+  function seconds(iso) {
+    var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || '');
+    if (!m) return 0;
+    return (+m[1] || 0) * 86400 + (+m[2] || 0) * 3600 + (+m[3] || 0) * 60 + (+m[4] || 0);
+  }
+
+  function clockOf(s) {
+    var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+    return h ? h + ':' + two(m) + ':' + two(x) : m + ':' + two(x);
+  }
+
+  function views(n) {
+    if (!(n > 0)) return '';
+    if (n >= 1e6) return trf('{n} M views', {n: fmt(n / 1e6, 1)});
+    if (n >= 1e3) return trf('{n} K views', {n: fmt(n / 1e3, 0)});
+    return trf('{n} views', {n: fmt(n, 0)});
+  }
+
+  function isShort(v, secs) {
+    var text = ((v.snippet && v.snippet.title) || '') + ' ' + ((v.snippet && v.snippet.description) || '');
+    return secs <= SHORTS_MAX || /#shorts?\b/i.test(text);
+  }
+
+  function thumbOf(t) {
+    var best = t && (t.maxres || t.standard || t.high || t.medium);
+    return best ? best.url : '';
+  }
+
+  function form(url, fields, done) {
+    var x = new XMLHttpRequest(), over = false, body = [];
+    for (var k in fields) if (fields.hasOwnProperty(k)) body.push(k + '=' + encodeURIComponent(fields[k]));
+    x.open('POST', url, true);
+    x.timeout = 10000;
+    x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    x.onreadystatechange = function () {
+      if (x.readyState !== 4 || over) return;
+      over = true;
+      var json = null;
+      try { json = JSON.parse(x.responseText); } catch (e) {}
+      done(x.status, json || {});
+    };
+    x.ontimeout = function () { if (!over) { over = true; done(0, {}); } };
+    x.send(body.join('&'));
+  }
+
+  function signedIn() { return !!(auth && auth.refresh); }
+
+  function signOut() {
+    auth = null;
+    later = [];
+    laterAt = 0;
+    laterMissing = false;
+    store('ytauth', null);
+    resetVideos();
+    changed();
+  }
+
+  function accessToken(done) {
+    if (!signedIn()) { done(null); return; }
+    if (auth.access && Date.now() < auth.exp - 60000) { done(auth.access); return; }
+    form(OAUTH + 'token', {client_id: YT_CLIENT, client_secret: YT_SECRET, refresh_token: auth.refresh, grant_type: 'refresh_token'},
+      function (status, res) {
+        if (status === 200 && res.access_token) {
+          auth.access = res.access_token;
+          auth.exp = Date.now() + (res.expires_in || 3600) * 1000;
+          store('ytauth', auth);
+          done(auth.access);
+          return;
+        }
+        if (res.error === 'invalid_grant') { ytError = 'signed-out'; signOut(); }
+        done(null);
+      });
+  }
+
+  function startLogin() {
+    if (!YT_CLIENT || (login && login.code)) return;
+    login = {asking: true};
+    changed();
+    form(OAUTH + 'device/code', {client_id: YT_CLIENT, scope: YT_SCOPE}, function (status, res) {
+      if (status !== 200 || !res.device_code) { login = {failed: res.error_description || res.error || 'HTTP ' + status}; changed(); return; }
+      login = {code: res.user_code, url: res.verification_url || 'google.com/device', device: res.device_code,
+        every: (res.interval || 5) * 1000, until: Date.now() + (res.expires_in || 1800) * 1000};
+      changed();
+      pollLogin();
+    });
+  }
+
+  function pollLogin() {
+    clearTimeout(loginTimer);
+    if (!login || !login.device) return;
+    if (Date.now() > login.until) { login = null; changed(); return; }
+    loginTimer = setTimeout(function () {
+      form(OAUTH + 'token', {client_id: YT_CLIENT, client_secret: YT_SECRET, device_code: login.device,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code'}, function (status, res) {
+        if (!login) return;
+        if (status === 200 && res.refresh_token) {
+          auth = {refresh: res.refresh_token, access: res.access_token, exp: Date.now() + (res.expires_in || 3600) * 1000};
+          store('ytauth', auth);
+          login = null;
+          ytError = '';
+          resetVideos();
+          laterAt = 0;
+          ytMore();
+          changed();
+          return;
+        }
+        if (res.error === 'slow_down') login.every += 5000;
+        if (res.error === 'access_denied' || res.error === 'expired_token') { login = null; changed(); return; }
+        pollLogin();
+      });
+    }, login.every);
+  }
+
+  function ytGet(path, token, done) {
+    var url = YT_API + path + (token ? '' : '&key=' + encodeURIComponent(YT_KEY));
+    get(url, token ? {Authorization: 'Bearer ' + token, Accept: 'application/json'} : {Accept: 'application/json'}, done);
+  }
+
+  function toVideo(v, keepShorts) {
+    var secs = seconds(v.contentDetails && v.contentDetails.duration);
+    if ((!keepShorts && isShort(v, secs)) || !thumbOf(v.snippet.thumbnails)) return null;
+    var parts = [v.snippet.channelTitle, clockOf(secs), views(+(v.statistics && v.statistics.viewCount))].filter(function (s) { return s; });
+    return {id: v.id, kind: 'youtube', title: v.snippet.title, thumb: thumbOf(v.snippet.thumbnails), meta: parts.join(' · '),
+      app: 'youtube', at: Date.parse(v.snippet.publishedAt) || 0};
+  }
+
+  function addVideos(list) {
+    var seen = {};
+    for (var i = 0; i < videos.length; i++) seen[videos[i].id] = true;
+    for (var j = 0; j < list.length; j++) if (list[j] && !seen[list[j].id]) { seen[list[j].id] = true; videos.push(list[j]); }
+  }
+
+  function saveVideos() {
+    if (!ytAt) ytAt = Date.now();
+    store('youtube', {videos: videos, at: ytAt, token: ytToken, done: ytDone, feedDone: feedDone});
+  }
+
+  function resetVideos() { videos = []; ytToken = ''; ytDone = false; feedDone = false; ytAt = 0; }
+
+  function inBatches(items, size, fn, done) {
+    var i = 0, running = 0;
+    (function fill() {
+      if (i >= items.length && !running) { done(); return; }
+      while (running < size && i < items.length) {
+        running++;
+        fn(items[i++], function () { running--; fill(); });
+      }
+    })();
+  }
+
+  function loadFeed(token) {
+    var channels = [], recent = [], since = Date.now() - FEED_DAYS * 86400000;
+    (function page(next) {
+      ytGet('subscriptions?part=snippet&mine=true&maxResults=50&order=relevance' + (next ? '&pageToken=' + next : ''), token, function (err, res) {
+        if (err) { finishFeed(err); return; }
+        for (var i = 0; res.items && i < res.items.length; i++) channels.push(res.items[i].snippet.resourceId.channelId);
+        if (res.nextPageToken && channels.length < CHANNELS_MAX) { page(res.nextPageToken); return; }
+        inBatches(channels.slice(0, CHANNELS_MAX), 4, function (channel, done) {
+          ytGet('playlistItems?part=contentDetails&maxResults=' + PER_CHANNEL + '&playlistId=UU' + channel.slice(2), token, function (e, r) {
+            for (var j = 0; !e && r.items && j < r.items.length; j++) {
+              var c = r.items[j].contentDetails;
+              if (Date.parse(c.videoPublishedAt) > since) recent.push(c.videoId);
+            }
+            done();
+          });
+        }, function () {
+          var found = [], chunks = [];
+          for (var k = 0; k < recent.length; k += 50) chunks.push(recent.slice(k, k + 50));
+          inBatches(chunks, 1, function (ids, done) {
+            ytGet('videos?part=snippet,contentDetails,statistics&id=' + ids.join(','), token, function (e, r) {
+              for (var m = 0; !e && r.items && m < r.items.length; m++) found.push(toVideo(r.items[m]));
+              done();
+            });
+          }, function () {
+            found = found.filter(function (v) { return v; }).sort(function (a, b) { return b.at - a.at; });
+            addVideos(found);
+            finishFeed(null);
+          });
+        });
+      });
+    })('');
+  }
+
+  function finishFeed(err) {
+    ytLoading = false;
+    feedDone = true;
+    if (err) ytError = err.message;
+    saveVideos();
+    changed();
+    if (videos.length < PRELOAD + 3) ytMore();
+  }
+
+  function ytMore() {
+    if (ytLoading || !ytApp()) return;
+    if (signedIn() && !feedDone) {
+      ytLoading = true;
+      changed();
+      accessToken(function (token) {
+        if (!token) { ytLoading = false; feedDone = true; changed(); ytMore(); return; }
+        loadFeed(token);
+      });
+      return;
+    }
+    if (!YT_KEY || ytDone) return;
+    ytLoading = true;
+    changed();
+    ytGet('videos?part=snippet,contentDetails,statistics&chart=mostPopular&maxResults=25&regionCode=' + REGION
+        + '&hl=' + encodeURIComponent(I18N.base) + (ytToken ? '&pageToken=' + encodeURIComponent(ytToken) : ''), null, function (err, res) {
+      ytLoading = false;
+      if (err) { ytError = err.message; ytDone = true; changed(); return; }
+      var list = [];
+      for (var j = 0; res.items && j < res.items.length; j++) list.push(toVideo(res.items[j]));
+      addVideos(list);
+      ytToken = res.nextPageToken || '';
+      ytDone = !ytToken;
+      saveVideos();
+      changed();
+      if (videos.length < PRELOAD + 3 && !ytDone) ytMore();
+    });
+  }
+
+  function refreshYouTube() {
+    if (!YT_KEY && !signedIn()) return;
+    var t = Date.now();
+    if (t - ytAt > 3 * 3600000 || t < ytAt) { resetVideos(); ytError = ''; }
+    if (!videos.length) ytMore();
+  }
+
+  var LATER_NAME = (CONFIG.youtubePlaylist || 'TV').trim(), LATER_FRESH = 2 * 60000;
+  var later = [], laterAt = 0, laterLoading = false, laterMissing = false, laterError = '';
+
+  function findPlaylist(token, done) {
+    var wanted = LATER_NAME.toLowerCase();
+    (function page(next) {
+      ytGet('playlists?part=snippet&mine=true&maxResults=50' + (next ? '&pageToken=' + next : ''), token, function (err, res) {
+        if (err) { done(err); return; }
+        for (var i = 0; res.items && i < res.items.length; i++) {
+          if ((res.items[i].snippet.title || '').trim().toLowerCase() === wanted) { done(null, res.items[i].id); return; }
+        }
+        if (res.nextPageToken) page(res.nextPageToken); else done(null, null);
+      });
+    })('');
+  }
+
+  function loadLater() {
+    if (laterLoading || !signedIn() || !ytApp()) return;
+    laterLoading = true;
+    changed();
+    function finish(err) {
+      laterLoading = false;
+      laterError = err ? err.message : '';
+      laterAt = Date.now();
+      changed();
+    }
+    accessToken(function (token) {
+      if (!token) { finish(new Error('signed out')); return; }
+      findPlaylist(token, function (err, id) {
+        if (err) { finish(err); return; }
+        laterMissing = !id;
+        if (!id) { later = []; finish(null); return; }
+        var items = [];
+        (function page(next) {
+          ytGet('playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=' + id + (next ? '&pageToken=' + next : ''), token, function (e, r) {
+            if (e) { finish(e); return; }
+            for (var j = 0; r.items && j < r.items.length; j++) {
+              items.push({id: r.items[j].contentDetails.videoId, added: Date.parse(r.items[j].snippet.publishedAt) || 0});
+            }
+            if (r.nextPageToken && items.length < 200) { page(r.nextPageToken); return; }
+            var added = {}, chunks = [], found = [];
+            for (var a = 0; a < items.length; a++) added[items[a].id] = items[a].added;
+            for (var k = 0; k < items.length; k += 50) chunks.push(items.slice(k, k + 50).map(function (x) { return x.id; }));
+            inBatches(chunks, 1, function (ids, done) {
+              ytGet('videos?part=snippet,contentDetails,statistics&id=' + ids.join(','), token, function (e2, r2) {
+                for (var m = 0; !e2 && r2.items && m < r2.items.length; m++) {
+                  var v = toVideo(r2.items[m], true);
+                  if (v) { v.at = added[v.id] || v.at; found.push(v); }
+                }
+                done();
+              });
+            }, function () {
+              later = found.sort(function (x, y) { return y.at - x.at; });
+              finish(null);
+            });
+          });
+        })('');
+      });
+    });
+  }
+
+  function loginCard(title) {
+    var card = {id: 'yt-login', kind: 'ytlogin', app: 'youtube', title: title};
+    if (login && login.code) { card.code = login.code; card.meta = trf('On your phone, open {url} and enter the code', {url: login.url.replace(/^https?:\/\/(www\.)?/, '')}); }
+    else if (login && login.asking) card.meta = tr('Getting a code…');
+    else if (login && login.failed) card.meta = trf("Couldn't get a code: {error}", {error: login.failed});
+    else card.meta = tr('Press OK to connect your YouTube account');
+    return card;
+  }
+
+  function laterRow() {
+    if (!ytApp()) return [];
+    if (!signedIn()) return [loginCard(tr('Watch Later'))];
+    if (!laterAt && !laterLoading) loadLater();
+    if (laterMissing) return [{id: 'yt-later-missing', kind: 'ytinfo', app: 'youtube', code: LATER_NAME, title: tr('Watch Later'),
+      meta: trf('Create a playlist named "{name}" on YouTube and save videos to it', {name: LATER_NAME})}];
+    if (laterAt && !laterLoading && !later.length) return [{id: 'yt-later-empty', kind: 'ytinfo', app: 'youtube', code: LATER_NAME,
+      title: tr('Watch Later'), meta: trf('Your "{name}" playlist is empty', {name: LATER_NAME})}];
+    return later;
+  }
+
+  function ytRow() {
+    if (!ytApp()) return [];
+    if (!YT_CLIENT || signedIn()) return videos;
+    var card = loginCard(tr('Videos from your subscriptions'));
+    return [card].concat(videos);
   }
 
   // MARK: - Formatting
@@ -606,7 +1035,23 @@ var Data = (function () {
     appFor: appFor,
     usable: usable,
     services: services,
-    refresh: function () { refreshWeather(); refreshPrices(); refreshRecs(); },
+    refresh: function () { refreshWeather(); refreshPrices(); refreshRecs(); refreshYouTube(); },
+    row: function (kind) { return kind === 'youtube' ? ytRow() : kind === 'later' ? laterRow() : row(kind); },
+    reloadLater: function () { if (signedIn() && (Date.now() - laterAt > LATER_FRESH || laterError)) loadLater(); },
+    hasWatchLater: function () { return !!YT_CLIENT; },
+    youTubeLogin: startLogin,
+    youTubeSignedIn: signedIn,
+    youTubeSignOut: signOut,
+    more: function (kind) { if (kind === 'youtube') ytMore(); else if (kind !== 'later') more(kind); },
+    fresh: function (kind) { if (kind !== 'youtube' && kind !== 'later') fresh(kind); },
+    loading: function (kind) { return kind === 'youtube' ? ytLoading : kind === 'later' ? laterLoading : !!loadingMore[String(kind)] || fetchingRecs; },
+    canGrow: function (kind) {
+      if (kind === 'later') return false;
+      return kind === 'youtube' ? (signedIn() && !feedDone) || (!!YT_KEY && !ytDone) : canGrow(kind);
+    },
+    hasYouTube: function () { return !!YT_KEY || !!YT_CLIENT; },
+    youTubeApp: ytApp,
+    youTubeError: function () { return ytError; },
     settingsChanged: function () { pricesAt = 0; refreshPrices(); changed(); },
     findCity: findCity,
     /** Another city picked: its weather now (none shown until it comes). */

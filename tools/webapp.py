@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 import translate  # noqa: E402  (the catalogues and the keys the web app uses)
 
-GENERIC = {'tmdbKey': '', 'tmdbRegion': '', 'latitude': '', 'longitude': '', 'city': '', 'language': 'auto',
+GENERIC = {'tmdbKey': '', 'tmdbRegion': '', 'youtubeKey': '', 'youtubeClientId': '', 'youtubeClientSecret': '', 'youtubePlaylist': 'TV', 'latitude': '', 'longitude': '', 'city': '', 'language': 'auto',
            'currency': '', 'temperature': 'auto', 'theme': 'auto', 'showCrypto': True, 'hideAnimation': False, 'hideApps': [],
            'shelfApps': [], 'drawerFirst': False}
 
@@ -54,6 +54,10 @@ def read_config(path):
     return {
         'tmdbKey': values.get('tmdb_key', ''),
         'tmdbRegion': values.get('tmdb_region', 'US') or 'US',
+        'youtubeKey': values.get('youtube_key', ''),
+        'youtubeClientId': values.get('youtube_client_id', ''),
+        'youtubeClientSecret': values.get('youtube_client_secret', ''),
+        'youtubePlaylist': values.get('youtube_playlist', 'TV') or 'TV',
         'latitude': number('latitude', '40.7128'),
         'longitude': number('longitude', '-74.0060'),
         'city': values.get('city', ''),
